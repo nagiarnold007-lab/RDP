@@ -1,0 +1,103 @@
+
+name: RDP
+
+on: [workflow_dispatch]
+
+jobs:
+  secure-rdp:
+    runs-on: RDP
+    timeout-minutes: 43200
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove old firewall rule if present (ignore errors)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || echo "No old rule"
+
+          # Allow RDP
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $charSet = @{
+            Upper   = [char[]]([char]65..[char]90)
+            Lower   = [char[]]([char]97..[char]122)
+            Number  = [char[]]([char]48..[char]57)
+            Special = [char[]]([char]33..[char]47)
+          }
+
+          $pwdArray = @()
+          $pwdArray += $charSet.Upper   | Get-Random -Count 4
+          $pwdArray += $charSet.Lower   | Get-Random -Count 4
+          $pwdArray += $charSet.Number  | Get-Random -Count 4
+          $pwdArray += $charSet.Special | Get-Random -Count 4
+          $password = -join ($pwdArray | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          Write-Output "RDP_USER=RDP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Output "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $path = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $path
+          Start-Process msiexec.exe -ArgumentList "/i", ""$path"", "/quiet", "/norestart" -Wait
+          Remove-Item $path -Force
+
+      - name: Establish Tailscale connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsip = ""
+          for ($i=0; $i -lt 10; $i++) {
+            $tsip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+            if ($tsip) { break }
+            Start-Sleep 5
+          }
+
+          if (-not $tsip) {
+            Write-Error "Tailscale IP not assigned"
+            exit 1
+          }
+
+          Write-Output "TAILSCALE_IP=$tsip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          if (-not $result) {
+            Write-Error "TCP connection to RDP port 3389 failed"
+            exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host "`n==== YOUR RDP DETAILS ===="
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username : $env:RDP_USER"
+          Write-Host "Password : $env:RDP_PASSWORD"
+          Write-Host "==========================`n"
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Running..."
